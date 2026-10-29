@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from fetch_game import BASE_URL, PROJECT_ROOT
 from import_game import integer, insert_row, parse_boxscore
+from import_players import ensure_player, ensure_name
 
 
 def event_seconds(value):
@@ -20,6 +21,77 @@ def event_seconds(value):
         raise ValueError("Некорректное время события")
     minutes, seconds = map(int, value.split(":"))
     return minutes * 60 + seconds
+
+
+def validate_shootout_sequence(attempts, winner):
+    if not attempts:
+        raise ValueError("Отсутствуют попытки серии буллитов")
+    counts, goals = Counter(), Counter()
+    first_side = attempts[0]['side']
+    ended = False
+    for index, attempt in enumerate(attempts):
+        if ended:
+            raise ValueError("В серии есть попытки после определения победителя")
+        expected = first_side if index % 2 == 0 else ('away' if first_side == 'home' else 'home')
+        if attempt['side'] != expected:
+            raise ValueError("Нарушено чередование сторон в серии буллитов")
+        side = attempt['side']
+        counts[side] += 1
+        goals[side] += int(attempt['is_scored'])
+        if max(counts['home'], counts['away']) <= 3:
+            ended = any(goals[s] > goals[o] + (3 - counts[o])
+                        for s, o in (('home','away'),('away','home')))
+        else:
+            ended = counts['home'] == counts['away'] and goals['home'] != goals['away']
+    if not ended:
+        raise ValueError("Серия буллитов не завершена")
+    actual_winner = 'home' if goals['home'] > goals['away'] else 'away'
+    if actual_winner != winner:
+        raise ValueError("Победитель серии не совпадает с официальным счётом")
+
+
+def parse_shootouts(plays, people, side_by_team, winner):
+    ordered = []
+    ids, positions = set(), set()
+    for play in plays:
+        if not isinstance(play, dict):
+            raise ValueError("Некорректное событие")
+        descriptor = play.get('periodDescriptor') or {}
+        if descriptor.get('periodType') != 'SO':
+            continue
+        kind = play.get('typeDescKey')
+        details = play.get('details') or {}
+        if kind not in ('goal','shot-on-goal','missed-shot'):
+            if 'shootingPlayerId' in details or 'scoringPlayerId' in details:
+                raise ValueError("Неизвестный тип попытки буллита")
+            continue
+        if descriptor.get('number') != 5:
+            raise ValueError("Неожиданный номер периода серии буллитов")
+        eid = integer(play.get('eventId'), 'shootout eventId')
+        position = integer(play.get('sortOrder'), 'shootout sortOrder')
+        if eid in ids or position in positions:
+            raise ValueError("Повтор ID или порядка попытки буллита")
+        ids.add(eid); positions.add(position)
+        shooter = integer(details.get('scoringPlayerId' if kind == 'goal' else 'shootingPlayerId'), 'shooter', 1)
+        team = integer(details.get('eventOwnerTeamId'), 'shootout team', 1)
+        if team not in side_by_team or shooter not in people or people[shooter]['side'] != side_by_team[team]:
+            raise ValueError("Исполнитель буллита не соответствует стороне")
+        goalie = details.get('goalieInNetId')
+        if goalie is not None:
+            integer(goalie, 'goalie', 1)
+            if goalie not in people or people[goalie]['side'] == people[shooter]['side']:
+                raise ValueError("Вратарь буллита не представляет противоположную сторону")
+        ordered.append((position, {'external_id':str(eid),'shooter':shooter,'goalie':goalie,
+                                  'side':side_by_team[team],'is_scored':kind == 'goal'}))
+    if winner is None:
+        if ordered:
+            raise ValueError("Буллиты найдены у матча с другим способом завершения")
+        return []
+    attempts = [row for _, row in sorted(ordered, key=lambda pair:pair[0])]
+    validate_shootout_sequence(attempts, winner)
+    for number, attempt in enumerate(attempts, 1):
+        attempt['attempt_no'] = number
+    return attempts
 
 
 def parse_events(pbp, boxscore, game_id):
@@ -35,8 +107,6 @@ def parse_events(pbp, boxscore, game_id):
             raise ValueError("Команды или счёт play-by-play и boxscore различаются")
     if match["status"] != "finished":
         raise ValueError("Пока поддерживаются только завершённые матчи")
-    if match["finish_type"] == "shootout":
-        raise ValueError("Матчи с послематчевыми буллитами подключим отдельно")
     if pbp.get("limitedScoring") is not False or boxscore.get("limitedScoring") is not False:
         raise ValueError("Источник не подтверждает подробное покрытие")
     plays = pbp.get("plays")
@@ -54,13 +124,31 @@ def parse_events(pbp, boxscore, game_id):
             raise ValueError("Некорректная принадлежность игрока в rosterSpots")
         if not isinstance(first, str) or not first.strip() or not isinstance(last, str) or not last.strip():
             raise ValueError("Отсутствует полное имя игрока в rosterSpots")
-        people[pid] = {"side": side_by_team[team_id], "name": f"{first.strip()} {last.strip()}"}
+        jersey = p.get('sweaterNumber')
+        if jersey is not None:
+            integer(jersey, 'roster sweaterNumber')
+            if jersey > 99:
+                raise ValueError('Номер игрока вне диапазона 0–99')
+        people[pid] = {"side": side_by_team[team_id], "name": f"{first.strip()} {last.strip()}",
+                       "jersey_number": jersey}
 
+    winner = None
+    expected_goals = {side:match['sides'][side]['score'] for side in ('home','away')}
+    if match['finish_type'] == 'shootout':
+        if match['game_type_code'] != 'regular' or abs(expected_goals['home']-expected_goals['away']) != 1:
+            raise ValueError('Некорректный официальный счёт матча с буллитами')
+        winner = 'home' if expected_goals['home'] > expected_goals['away'] else 'away'
+        expected_goals[winner] -= 1
+        if expected_goals['home'] != expected_goals['away']:
+            raise ValueError('Перед серией буллитов счёт должен быть равным')
+    attempts = parse_shootouts(plays, people, side_by_team, winner)
     events, ids, side_goals = [], set(), Counter()
     scoring = {"goals": Counter(), "assists": Counter()}
     for play in plays:
         if not isinstance(play, dict):
             raise ValueError("Некорректное событие")
+        if (play.get("periodDescriptor") or {}).get("periodType") == "SO":
+            continue
         if play.get("typeDescKey") != "goal":
             continue
         eid = integer(play.get("eventId"), "eventId")
@@ -101,7 +189,9 @@ def parse_events(pbp, boxscore, game_id):
         side_goals[side_by_team[team]] += 1
         events.append({"external_id": str(eid), "scorer": scorer, "assists": assistants,
                        "side": side_by_team[team], "period_no": number, "elapsed_seconds": elapsed})
-    if any(side_goals[s] != match["sides"][s]["score"] for s in ("home", "away")):
+    if ids & {int(a['external_id']) for a in attempts}:
+        raise ValueError('Один ID используется и для гола, и для буллита')
+    if any(side_goals[s] != expected_goals[s] for s in ("home", "away")):
         raise ValueError("Число голов не совпадает со счётом матча")
 
     stats = boxscore.get("playerByGameStats") or {}
@@ -133,6 +223,7 @@ def parse_events(pbp, boxscore, game_id):
                         box_counts[category][pid] = count
     if scoring != box_counts:
         raise ValueError("Голы/передачи игроков не совпадают с boxscore: обнови оба ответа")
+    match["shootouts"] = attempts
     return match, events, people
 
 
@@ -208,6 +299,66 @@ def tombstone_assist(connection, goal_id, order, raw_id, timestamp):
     return False
 
 
+def event_participant(connection, source_id, external_id, game_id, person, raw_id, timestamp):
+    player_id, person_id = ensure_player(connection, source_id, str(external_id))
+    ensure_name(connection, person_id, person['name'], raw_id, timestamp)
+    current = connection.execute(
+        """SELECT side, is_deleted FROM core.game_player_versions
+           WHERE game_id=%s AND player_id=%s AND known_to='infinity'::timestamptz""",
+        (game_id,player_id)).fetchone()
+    if current:
+        if current['is_deleted'] or current['side'] != person['side']:
+            raise ValueError(f"Конфликт участия игрока NHL {external_id}")
+    else:
+        write_version(connection,'core','game_player_versions',
+                      {'game_id':game_id,'player_id':player_id},
+                      {'side':person['side'],'jersey_number':person['jersey_number']},raw_id,timestamp)
+    return player_id
+
+
+def sync_shootouts(connection, source_id, game_id, attempts, players, raw_id, timestamp):
+    desired = {}
+    fields = ('game_id','shooter_player_id','goalie_player_id','attempt_no','is_scored')
+    for attempt in attempts:
+        row = connection.execute(
+            """SELECT attempt_id FROM ingest.shootout_attempt_source_ids
+               WHERE source_id=%s AND game_id=%s AND external_id=%s""",
+            (source_id,game_id,attempt['external_id'])).fetchone()
+        if row:
+            aid = row['attempt_id']
+        else:
+            aid = connection.execute('INSERT INTO core.shootout_attempts DEFAULT VALUES RETURNING attempt_id').fetchone()['attempt_id']
+            insert_row(connection,'ingest','shootout_attempt_source_ids',
+                       {'source_id':source_id,'game_id':game_id,'external_id':attempt['external_id'],'attempt_id':aid})
+        desired[aid] = {'game_id':game_id,'shooter_player_id':players[attempt['shooter']],
+                        'goalie_player_id':players[attempt['goalie']] if attempt['goalie'] is not None else None,
+                        'attempt_no':attempt['attempt_no'],'is_scored':attempt['is_scored']}
+    old = connection.execute(
+        """SELECT a.attempt_id,a.game_id,a.shooter_player_id,a.goalie_player_id,a.attempt_no,a.is_scored
+           FROM core.shootout_attempt_versions AS a
+           JOIN ingest.shootout_attempt_source_ids AS m ON m.attempt_id=a.attempt_id
+           WHERE m.source_id=%s AND m.game_id=%s AND a.game_id=%s
+             AND a.known_to='infinity'::timestamptz AND NOT a.is_deleted""",
+        (source_id,game_id,game_id)).fetchall()
+    changes = 0
+    for row in old:
+        aid = row['attempt_id']
+        if desired.get(aid) == {k:row[k] for k in fields}:
+            continue
+        connection.execute(
+            """UPDATE core.shootout_attempt_versions SET known_to=%s
+               WHERE attempt_id=%s AND known_to='infinity'::timestamptz""", (timestamp,aid))
+        changes += 1
+        if aid not in desired:
+            insert_row(connection,'core','shootout_attempt_versions',
+                       {'attempt_id':aid,**{k:row[k] for k in fields},'known_from':timestamp,
+                        'raw_id':raw_id,'is_deleted':True})
+    for aid, values in desired.items():
+        changes += int(write_version(connection,'core','shootout_attempt_versions',
+                                     {'attempt_id':aid},values,raw_id,timestamp))
+    return changes
+
+
 def import_events(game_id):
     load_dotenv(PROJECT_ROOT / ".env")
     password = os.getenv("POSTGRES_PASSWORD")
@@ -219,7 +370,7 @@ def import_events(game_id):
                         dbname=os.getenv("POSTGRES_DB", "nhl"), user=os.getenv("POSTGRES_USER", "nhl"),
                         password=password, autocommit=True, connect_timeout=5, row_factory=dict_row,
                         application_name="nhl_events_import") as connection:
-        run_id = insert_row(connection, "ingest", "ingestion_runs", {"loader_version": "goals-import-v1"}, "run_id")
+        run_id = insert_row(connection, "ingest", "ingestion_runs", {"loader_version": "events-import-v2"}, "run_id")
         raw_id = None
         try:
             with connection.transaction():
@@ -256,30 +407,25 @@ def import_events(game_id):
                 latest = connection.execute(
                     """SELECT max(r.fetched_at) AS t FROM ingest.raw_snapshots AS r JOIN (
                            SELECT raw_id FROM core.goal_versions WHERE game_id = %s AND known_to = 'infinity'::timestamptz
+                           UNION SELECT raw_id FROM core.shootout_attempt_versions
+                           WHERE game_id = %s AND known_to = 'infinity'::timestamptz
                            UNION SELECT a.raw_id FROM core.goal_assist_versions AS a
                            JOIN ingest.goal_source_ids AS m ON m.goal_id = a.goal_id
                            WHERE m.game_id = %s AND a.known_to = 'infinity'::timestamptz
                            UNION SELECT raw_id FROM ingest.game_coverage_versions
                            WHERE game_id = %s AND dataset_code = 'events' AND known_to = 'infinity'::timestamptz
-                       ) AS used ON used.raw_id = r.raw_id""", (internal_id,internal_id,internal_id)
+                       ) AS used ON used.raw_id = r.raw_id""", (internal_id,internal_id,internal_id,internal_id)
                 ).fetchone()['t']
                 if latest is not None and latest > raw['fetched_at']:
                     raise ValueError("Нельзя перезаписать события более старым ответом")
                 timestamp = connection.execute('SELECT clock_timestamp() AS t').fetchone()['t']
                 involved = {e['scorer'] for e in events} | {p for e in events for p in e['assists'].values()}
+                involved |= {a['shooter'] for a in match['shootouts']}
+                involved |= {a['goalie'] for a in match['shootouts'] if a['goalie'] is not None}
                 players = {}
                 for external_player in involved:
-                    player = connection.execute(
-                        """SELECT p.player_id FROM ingest.player_source_ids AS m
-                           JOIN core.players AS p ON p.player_id = m.player_id
-                           JOIN core.v_current_game_players AS gp ON gp.player_id = p.player_id
-                           WHERE m.source_id = %s AND m.external_id = %s
-                             AND gp.game_id = %s AND gp.side = %s""",
-                        (source_id,str(external_player),internal_id,people[external_player]['side'])
-                    ).fetchone()
-                    if player is None:
-                        raise ValueError(f"Нет участия игрока NHL {external_player}: сначала запусти import_players.py")
-                    players[external_player] = player['player_id']
+                    players[external_player] = event_participant(
+                        connection,source_id,external_player,internal_id,people[external_player],raw_id,timestamp)
                 changes = 0
                 present = set()
                 for event in events:
@@ -321,6 +467,7 @@ def import_events(game_id):
                     changes += int(write_version(connection,'core','goal_versions',{'goal_id':old['goal_id']},
                         {k:old[k] for k in ('game_id','scorer_player_id','period_no','elapsed_seconds')},
                         raw_id,timestamp,deleted=True))
+                changes += sync_shootouts(connection,source_id,internal_id,match['shootouts'],players,raw_id,timestamp)
                 write_version(connection,'ingest','game_coverage_versions',
                               {'game_id':internal_id,'dataset_code':'events'},
                               {'coverage_status':'complete'},raw_id,timestamp)
@@ -332,6 +479,7 @@ def import_events(game_id):
                 connection.execute("UPDATE ingest.ingestion_runs SET status='success', finished_at=clock_timestamp() WHERE run_id=%s",(run_id,))
             print(f"Импорт событий завершён: game_id={internal_id}, NHL game_id={game_id}")
             print(f"Голов: {len(events)}; передач: {sum(len(e['assists']) for e in events)}")
+            print(f"Попыток буллитов: {len(match['shootouts'])}")
             print(f"Изменений истории событий: {changes}")
             print(f"run_id={run_id}, raw_id={raw_id}, boxscore_raw_id={box_raw['raw_id']}")
         except BaseException as error:
@@ -347,7 +495,7 @@ def import_events(game_id):
 
 
 if __name__ == '__main__':
-    parser=argparse.ArgumentParser(description='Импорт голов и передач из play-by-play')
+    parser=argparse.ArgumentParser(description='Импорт голов, передач и буллитов из play-by-play')
     parser.add_argument('game_id',type=int)
     args=parser.parse_args()
     if args.game_id<=0:parser.error('game_id должен быть положительным')
