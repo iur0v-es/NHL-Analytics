@@ -1,4 +1,4 @@
-"""Import goals and assists only after reconciliation with a final boxscore."""
+"""Import goals, assists and shootouts after reconciliation with a final boxscore."""
 import argparse
 from collections import Counter
 import hashlib
@@ -61,7 +61,7 @@ def parse_shootouts(plays, people, side_by_team, winner):
             continue
         kind = play.get('typeDescKey')
         details = play.get('details') or {}
-        if kind not in ('goal','shot-on-goal','missed-shot'):
+        if kind not in ('goal','shot-on-goal','missed-shot','failed-shot-attempt'):
             if 'shootingPlayerId' in details or 'scoringPlayerId' in details:
                 raise ValueError("Неизвестный тип попытки буллита")
             continue
@@ -197,6 +197,7 @@ def parse_events(pbp, boxscore, game_id):
     stats = boxscore.get("playerByGameStats") or {}
     box_counts = {"goals": Counter(), "assists": Counter()}
     listed = set()
+    unknown_counts = {"goals": set(), "assists": set()}
     for side, key in (("home", "homeTeam"), ("away", "awayTeam")):
         groups = stats.get(key)
         if not isinstance(groups, dict):
@@ -215,14 +216,25 @@ def parse_events(pbp, boxscore, game_id):
                     if count is None:
                         if group != "goalies":
                             raise ValueError("Отсутствуют голы/передачи полевого игрока")
-                        count = 0
+                        unknown_counts[category].add(pid)
+                        continue
                     integer(count, category)
                     if count:
                         if pid not in people or people[pid]["side"] != side:
                             raise ValueError("Статистика игрока не согласована с составом")
                         box_counts[category][pid] = count
-    if scoring != box_counts:
-        raise ValueError("Голы/передачи игроков не совпадают с boxscore: обнови оба ответа")
+    if any(set(counts) - listed for counts in scoring.values()):
+        raise ValueError("Участник гола или передачи отсутствует в статистике boxscore")
+    mismatches = []
+    for category in ("goals", "assists"):
+        for pid in sorted(set(scoring[category]) | set(box_counts[category])):
+            if pid in unknown_counts[category]:
+                continue
+            actual, expected = scoring[category][pid], box_counts[category][pid]
+            if actual != expected:
+                mismatches.append(f"{category}: playerId={pid}, play-by-play={actual}, boxscore={expected}")
+    if mismatches:
+        raise ValueError("Голы/передачи игроков не совпадают с boxscore: " + "; ".join(mismatches))
     match["shootouts"] = attempts
     return match, events, people
 
@@ -370,7 +382,7 @@ def import_events(game_id):
                         dbname=os.getenv("POSTGRES_DB", "nhl"), user=os.getenv("POSTGRES_USER", "nhl"),
                         password=password, autocommit=True, connect_timeout=5, row_factory=dict_row,
                         application_name="nhl_events_import") as connection:
-        run_id = insert_row(connection, "ingest", "ingestion_runs", {"loader_version": "events-import-v2"}, "run_id")
+        run_id = insert_row(connection, "ingest", "ingestion_runs", {"loader_version": "events-import-v3"}, "run_id")
         raw_id = None
         try:
             with connection.transaction():
